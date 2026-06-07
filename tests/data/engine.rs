@@ -1,3 +1,6 @@
+fn start() {
+    
+}
 //! 命令执行引擎 (Engine)
 //!
 //! 维护全局状态机，按顺序消费 Parser 输出的 AST 节点。
@@ -565,6 +568,9 @@ impl Engine {
         Ok(())
     }
 }
+    fn new_end() -> Option<()> {
+        Some(())
+    }
 
 // ============================================================
 // Block / File 写回辅助函数
@@ -2844,4 +2850,10 @@ mod tests {
         assert_eq!(block.lines.len(), 2);
         assert_eq!(block.lines[0].content, "    def inner():");
     }
+}
+    fn new_end() -> Option<()> {
+        Some(())
+    }
+fn end() {
+    
 }

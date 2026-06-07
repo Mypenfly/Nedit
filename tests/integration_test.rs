@@ -1651,3 +1651,351 @@ fn test_multi_op_refactor() {
 
     check_indentation_consistency(&result).expect("Indentation check failed");
 }
+
+// ============================================================
+// 语法手册场景验证测试（9 个场景）
+// ============================================================
+
+#[test]
+fn test_scenario01_add_field() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario01_add_field.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario01_add_field failed");
+
+    let result = env.read_target();
+    assert!(
+        result.contains("pub log_level: String"),
+        "Should contain new field"
+    );
+    assert!(
+        result.contains("pub name: String"),
+        "Original field should remain"
+    );
+    assert!(
+        result.contains("pub version: String"),
+        "Original field should remain"
+    );
+
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert_eq!(added.len(), 1, "Should have 1 Added line");
+    assert_eq!(
+        engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_scenario02_insert_code() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario02_insert_code.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario02_insert_code failed");
+
+    let result = env.read_target();
+    assert!(
+        result.contains("processing input:"),
+        "Should contain log line"
+    );
+    assert!(
+        result.contains("pub fn process"),
+        "Original function should remain"
+    );
+
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert_eq!(added.len(), 1, "Should have 1 Added line");
+    assert!(added[0].content.contains("log::info"));
+}
+
+#[test]
+fn test_scenario03_replace_func() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario03_replace_func.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario03_replace_func failed");
+
+    let result = env.read_target();
+    assert!(
+        !result.contains("result.push_str"),
+        "Old for-loop should be gone"
+    );
+    assert!(
+        result.contains("self.items.join"),
+        "New join call should exist"
+    );
+    assert!(
+        result.contains("pub fn deprecated_method"),
+        "Function signature should remain"
+    );
+    assert!(
+        result.contains("pub fn active_count"),
+        "Next function should remain"
+    );
+
+    let deleted: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+        .collect();
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert!(deleted.len() >= 3, "Should have Deleted lines");
+    assert_eq!(added.len(), 1, "Should have 1 Added line");
+}
+
+#[test]
+fn test_scenario04_line_range() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario04_line_range.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario04_line_range failed");
+
+    let result = env.read_target();
+    assert!(
+        !result.contains("pub data_dir: PathBuf"),
+        "Old field should be replaced"
+    );
+    assert!(
+        result.contains("pub max_connections: u32"),
+        "Should contain new max_connections"
+    );
+    assert!(
+        result.contains("pub timeout_secs: u64"),
+        "Should contain new timeout_secs"
+    );
+    assert!(
+        result.contains("pub struct AppConfig"),
+        "Struct should remain"
+    );
+
+    let deleted: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+        .collect();
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert_eq!(deleted.len(), 2, "Should delete 2 lines");
+    assert_eq!(added.len(), 3, "Should add 3 new lines");
+}
+
+#[test]
+fn test_scenario05_append_method() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario05_append_method.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario05_append_method failed");
+
+    let result = env.read_target();
+    assert!(
+        result.contains("pub fn item_count"),
+        "Should contain new item_count method"
+    );
+    assert!(
+        result.contains("self.items.len()"),
+        "Should contain method body"
+    );
+    assert!(
+        result.contains("pub fn new"),
+        "Original new() should remain"
+    );
+    assert!(
+        result.contains("pub fn process"),
+        "Original process() should remain"
+    );
+
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert!(added.len() >= 3, "Should have at least 3 Added lines");
+    assert_eq!(
+        engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_scenario06_deep_nested() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario06_deep_nested.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario06_deep_nested failed");
+
+    let result = env.read_target();
+    assert!(
+        !result.contains("processor.process(\"hello\")"),
+        "Old process call should be gone"
+    );
+    assert!(
+        result.contains("greeting:"),
+        "Should contain new format call"
+    );
+    assert!(
+        result.contains("processing result:"),
+        "Should contain result log"
+    );
+    assert!(result.contains("pub fn run"), "run function should remain");
+    assert!(
+        result.contains("config.validate()"),
+        "Original code should remain"
+    );
+
+    let deleted: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+        .collect();
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert_eq!(deleted.len(), 1, "Should delete 1 line");
+    assert!(added.len() >= 3, "Should have at least 3 Added lines");
+}
+
+#[test]
+fn test_scenario07_delete_block() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario07_delete_block.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario07_delete_block failed");
+
+    let result = env.read_target();
+    assert!(
+        !result.contains("pub fn deprecated_method"),
+        "deprecated_method should be deleted"
+    );
+    assert!(
+        !result.contains("self.items.join"),
+        "Method body should be deleted"
+    );
+    assert!(
+        result.contains("pub fn process"),
+        "Previous method should remain"
+    );
+    assert!(
+        result.contains("pub fn active_count"),
+        "Next method should remain"
+    );
+
+    let deleted: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+        .collect();
+    assert!(deleted.len() >= 3, "Should have Deleted lines");
+}
+
+#[test]
+fn test_scenario08_line_block() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario08_line_block.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario08_line_block failed");
+
+    let result = env.read_target();
+    assert!(
+        result.contains("pub fn with_chunk_size"),
+        "Should contain new builder method"
+    );
+    assert!(
+        result.contains("self.chunk_size = size;"),
+        "Should contain method body"
+    );
+    assert!(
+        result.contains("pub fn new()"),
+        "Original new() should remain"
+    );
+    assert!(
+        result.contains("pub fn process"),
+        "Original process() should remain"
+    );
+
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert!(added.len() >= 4, "Should have at least 4 Added lines");
+    assert_eq!(
+        engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn test_scenario09_delete_replace() {
+    let env = TestEnv::from_data_file("scenarios.rs");
+    let script = env.load_script("scenario09_delete_replace.ned");
+
+    let (engine, success) = execute_script(&script);
+    assert!(success, "scenario09_delete_replace failed");
+
+    let result = env.read_target();
+    assert!(
+        !result.contains("chunk_size: usize"),
+        "Old chunk_size field should be gone"
+    );
+    assert!(
+        result.contains("capacity: usize"),
+        "Should contain new capacity field"
+    );
+    assert!(
+        result.contains("priority: u8"),
+        "Should contain new priority field"
+    );
+    assert!(
+        result.contains("items: Vec<String>"),
+        "items field should remain"
+    );
+
+    let deleted: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Deleted)
+        .collect();
+    let added: Vec<_> = engine
+        .diff_lines
+        .iter()
+        .filter(|d| d.kind == n_edit::output::DiffLineKind::Added)
+        .collect();
+    assert_eq!(deleted.len(), 2, "Should delete 2 lines");
+    assert_eq!(added.len(), 3, "Should add 3 lines");
+}
