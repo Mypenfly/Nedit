@@ -11,6 +11,7 @@ use n_edit::engine::Engine;
 use n_edit::lexer::Lexer;
 use n_edit::output::OutputFormatter;
 use n_edit::parser::Parser as ScriptParser;
+use std::io::IsTerminal;
 
 /// N_Edit — 基于注解的代码编辑工具
 ///
@@ -52,7 +53,15 @@ fn main() {
 
     // 语法分析：Token 流 → AST (Command 序列)
     let commands = ScriptParser::parse(tokens).unwrap_or_else(|e| {
-        eprintln!("解析错误: {}", e);
+        eprint!(
+            "{}",
+            n_edit::output::format_error_with_color(
+                &e.title(),
+                &e.detail(),
+                &e.hints(),
+                std::io::stdout().is_terminal(),
+            )
+        );
         std::process::exit(1);
     });
     if cli.verbose {
@@ -61,19 +70,30 @@ fn main() {
 
     // 执行引擎：逐条执行 Command
     let mut engine = Engine::new();
+    if cli.verbose {
+        engine.set_verbose(true);
+    }
     match engine.execute(commands) {
         Ok(()) => {
             if !cli.quiet {
                 eprintln!("脚本执行成功: {}", cli.script_path);
-            }
-            // 输出 diff 结果
-            if !engine.diff_lines.is_empty() {
-                let formatter = OutputFormatter::new();
-                print!("{}", formatter.format_diff_lines(&engine.diff_lines));
+                // quiet 模式下不输出 diff
+                if !engine.diff_lines.is_empty() {
+                    let formatter = OutputFormatter::new();
+                    print!("{}", formatter.format_diff_lines(&engine.diff_lines));
+                }
             }
         }
         Err(e) => {
-            eprintln!("执行错误: {}", e);
+            eprint!(
+                "{}",
+                n_edit::output::format_error_with_color(
+                    &e.title(),
+                    &e.detail(),
+                    &e.hints(),
+                    std::io::stdout().is_terminal(),
+                )
+            );
             std::process::exit(1);
         }
     }

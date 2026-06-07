@@ -310,18 +310,17 @@ cargo test engine::tests::test_raw_ellipsis
 
 ---
 
-## Phase 6: 错误美化 / 彩色输出 ✅ 基本完成
+## Phase 6: 错误美化 / 彩色输出 ✅ 已完成
 
 **目标**：用户体验完好的错误提示和终端输出。
 
-> **当前状态**：核心功能已实现，后续可做细节打磨。
-
 ### 6.1 错误信息增强 ✅
 
-- [x] `error.rs`：所有错误类型实现详细的 `Display`
+- [x] `error.rs`：所有错误类型实现详细的 `title()`/`detail()`/`hints()`
   - 包含上下文代码块
   - 包含行号引用
   - 包含修复建议（中文提示）
+- [x] `NEditError` 根类型统一分发，支持 `format_error_colored()` 带颜色输出
 - [x] 错误输出格式统一（参考 INSTRUCTION.md 第 5.1 节）
 
 ### 6.2 彩色终端输出 ✅
@@ -329,23 +328,19 @@ cargo test engine::tests::test_raw_ellipsis
 - [x] `output.rs`：封装 `colored` 库
   - 绿色 `+` 标注新增行
   - 红色 `-` 标注删除行
-- [x] 检测终端能力：`is_terminal` 为 false 时关闭颜色（管道/重定向）
+  - `Error:` 红色加粗，描述黄色，`Hint:` 绿色加粗
+- [x] 检测终端能力：`is_terminal` 为 false 时自动关闭颜色（管道/重定向）
 
 ### 6.3 格式化输出 ✅
 
-- [x] ContentBlock 输出带行号前缀：`L12: content`（`format_diff_lines` 支持）
-- [x] 匹配诊断信息：最多展示 3 个候选，超过时显示 `(n more)`（`expect_single_match` 已实现）
+- [x] ContentBlock 输出带行号前缀：`L12: content`（`format_diff_lines`）
+- [x] 匹配诊断信息：最多展示 3 个候选，超过时显示 `(n more)`（`expect_single_match`）
+- [x] 多 Block 修改间插入 `~~~~~~~~` 分隔符（`insert_separator_if_needed`）
 
 ### 6.4 日志/详细模式 ✅
 
-- [x] `--verbose` 标志：打印执行过程（词法分析 token 数、语法分析命令数）
-- [x] `--quiet` 标志：只输出错误，不输出成功操作的 ContentBlock
-
-### 后续可改进
-
-1. **错误信息带颜色**：当前 `eprintln!` 未着色，可对错误类型关键词加黄色高亮。
-2. **错误位置标线**：显示源码片段并在出错行下方加 `^~~~` 指示。
-3. **JSON 错误输出**：`--error-format json` 方便 LLM 解析错误。
+- [x] `--verbose` 标志：打印每条命令的执行详情（Open 路径、Location 定位内容、New 行数、Delete 操作类型、Off 目标）
+- [x] `--quiet` 标志：抑制成功消息和 diff 输出，只输出错误
 
 ---
 
@@ -395,7 +390,7 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3 ✅ ──▶ Phas
 - Phase 2 → Phase 3：Block 指令依赖基础 New/Delete ✅
 - Phase 3 → Phase 4：嵌套依赖精确 Block 解析 ✅
 - Phase 5 可与 Phase 3/4 并行（行号定位不依赖嵌套）
-- Phase 6 已基本完成（可在 Phase 2 后持续增强）
+- Phase 6 已完成（错误美化、彩色输出、verbose/quiet 模式）
 - Phase 7 在所有核心功能稳定后开始
 
 ---
@@ -403,14 +398,14 @@ Phase 0 ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3 ✅ ──▶ Phas
 ## 当前测试状态
 
 ```
-cargo test  → 269 passed, 0 failed
+cargo test  → 297 passed, 0 failed
 cargo clippy → 0 warnings
 cargo fmt    → 0 differences
 
 测试分布：
-  src/ 单元测试             225 个（所有模块）
+  src/ 单元测试             244 个（所有模块）
   src/main.rs 集成测试        4 个
-  tests/integration_test.rs  40 个（含 5 个 Phase 5 集成测试）
+  tests/integration_test.rs  49 个（含 Phase 5/6 集成测试）
 ```
 
 ### 测试覆盖场景
@@ -423,6 +418,6 @@ cargo fmt    → 0 differences
 | Matcher 匹配算法 | 20 | 精确匹配、歧义报错、空行跳过、空 Location、Block scope 搜索、行号范围 |
 | Model 数据结构 | 30 | Line/ContentBlock 操作、reindex、first_line_index、文件读写、LineRange |
 | Block 解析器 | 18 | 花括号/缩进检测、逐字符扫描、注释/字符串转义处理 |
-| Error 错误类型 | 9 | Display 格式化、错误信息完整性 |
-| Output 输出格式化 | 4 | 彩色/无色、行号、ContentBlock |
-| 集成测试 | 40 | 真实文件 New/Delete/Replace、Location:Block、嵌套操作、歧义检查、行号定位/Delete、多操作复合场景 |
+| Error 错误类型 | 19 | Display 格式化、title/detail/hints、错误信息完整性 |
+| Output 输出格式化 | 11 | 彩色/无色、行号、ContentBlock、分隔符、错误格式化 |
+| 集成测试 | 49 | 真实文件 New/Delete/Replace、Location:Block、嵌套操作、歧义检查、行号定位/Delete、多操作复合场景 |

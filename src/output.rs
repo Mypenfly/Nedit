@@ -7,6 +7,7 @@
 //! 1. 检测终端能力（`is_terminal`），管道/重定向时自动关闭颜色
 //! 2. 新增行前加绿色 `+`，删除行前加红色 `-`
 //! 3. ContentBlock 输出带行号前缀
+//! 4. Phase 6: 错误彩色输出、上下文展示、分隔符
 //!
 //! ## 对应文档
 //!
@@ -16,6 +17,9 @@ use crate::model::LineNumber;
 use colored::Colorize;
 use std::io::IsTerminal;
 
+/// 上下文中展示的最大行数（修改区域上下各最多 7 行）
+pub const CONTEXT_MAX_LINES: usize = 7;
+
 /// 输出行的差异状态
 #[derive(Debug, PartialEq)]
 pub enum DiffLineKind {
@@ -23,9 +27,10 @@ pub enum DiffLineKind {
     Added,
     /// 删除的行
     Deleted,
-    /// 未变更的行
-    #[allow(dead_code)]
+    /// 未变更的行（上下文）
     Unchanged,
+    /// 分隔符行（"~~~~~~~~"）
+    Separator,
 }
 
 /// 一条带差异标记的输出行
@@ -37,6 +42,44 @@ pub struct DiffLine {
     pub line_number: Option<LineNumber>,
     /// 内容文本
     pub content: String,
+}
+
+impl DiffLine {
+    /// 创建一个分隔符行
+    pub fn separator() -> Self {
+        DiffLine {
+            kind: DiffLineKind::Separator,
+            line_number: None,
+            content: String::new(),
+        }
+    }
+
+    /// 创建一个不变的上下文行
+    pub fn unchanged(line_number: LineNumber, content: String) -> Self {
+        DiffLine {
+            kind: DiffLineKind::Unchanged,
+            line_number: Some(line_number),
+            content,
+        }
+    }
+
+    /// 创建一个新增行
+    pub fn added(line_number: LineNumber, content: String) -> Self {
+        DiffLine {
+            kind: DiffLineKind::Added,
+            line_number: Some(line_number),
+            content,
+        }
+    }
+
+    /// 创建一个删除行
+    pub fn deleted(line_number: LineNumber, content: String) -> Self {
+        DiffLine {
+            kind: DiffLineKind::Deleted,
+            line_number: Some(line_number),
+            content,
+        }
+    }
 }
 
 /// 终端输出格式化器
@@ -73,7 +116,8 @@ impl OutputFormatter {
     /// 格式化差异行列表为字符串输出
     ///
     /// 每行格式为: `[前缀] [行号]: [内容]`
-    /// 新增行绿色 `+`，删除行红色 `-`，未变更行无前缀。
+    /// 新增行绿色 `+`，删除行红色 `-`，未变更行灰色无前缀。
+    /// 分隔符行显示为灰色的 "  ~~~~~~~~"。
     pub fn format_diff_lines(&self, lines: &[DiffLine]) -> String {
         let mut output = String::new();
 
@@ -85,10 +129,15 @@ impl OutputFormatter {
                     } else {
                         "+".to_string()
                     };
-                    if let Some(line_num) = line.line_number {
-                        output.push_str(&format!("{} L{}: {}\n", prefix, line_num, line.content));
+                    let content = if self.use_color {
+                        line.content.green().to_string()
                     } else {
-                        output.push_str(&format!("{} {}\n", prefix, line.content));
+                        line.content.clone()
+                    };
+                    if let Some(line_num) = line.line_number {
+                        output.push_str(&format!("{} L{}: {}\n", prefix, line_num, content));
+                    } else {
+                        output.push_str(&format!("{} {}\n", prefix, content));
                     }
                 }
                 DiffLineKind::Deleted => {
@@ -97,18 +146,36 @@ impl OutputFormatter {
                     } else {
                         "-".to_string()
                     };
-                    if let Some(line_num) = line.line_number {
-                        output.push_str(&format!("{} L{}: {}\n", prefix, line_num, line.content));
+                    let content = if self.use_color {
+                        line.content.red().to_string()
                     } else {
-                        output.push_str(&format!("{} {}\n", prefix, line.content));
+                        line.content.clone()
+                    };
+                    if let Some(line_num) = line.line_number {
+                        output.push_str(&format!("{} L{}: {}\n", prefix, line_num, content));
+                    } else {
+                        output.push_str(&format!("{} {}\n", prefix, content));
                     }
                 }
                 DiffLineKind::Unchanged => {
-                    if let Some(line_num) = line.line_number {
-                        output.push_str(&format!("  L{}: {}\n", line_num, line.content));
+                    let content = if self.use_color {
+                        line.content.dimmed().to_string()
                     } else {
-                        output.push_str(&format!("  {}\n", line.content));
+                        line.content.clone()
+                    };
+                    if let Some(line_num) = line.line_number {
+                        output.push_str(&format!("  L{}: {}\n", line_num, content));
+                    } else {
+                        output.push_str(&format!("  {}\n", content));
                     }
+                }
+                DiffLineKind::Separator => {
+                    let sep = if self.use_color {
+                        "  ~~~~~~~~".dimmed().to_string()
+                    } else {
+                        "  ~~~~~~~~".to_string()
+                    };
+                    output.push_str(&format!("{}\n", sep));
                 }
             }
         }
@@ -130,6 +197,55 @@ impl OutputFormatter {
             .collect();
         self.format_diff_lines(&lines)
     }
+}
+
+/// 格式化带颜色的错误输出
+///
+/// 错误标题 "Error:" 使用红色加粗，错误描述使用黄色。
+/// "Hint:" 提示使用绿色加粗，提示内容使用白色/默认色。
+pub fn format_error_colored(title: &str, detail: &str, hints: &[&str]) -> String {
+    let use_color = std::io::stdout().is_terminal();
+    format_error_impl(title, detail, hints, use_color)
+}
+
+/// 格式化错误输出（可指定是否使用颜色）
+pub fn format_error_with_color(
+    title: &str,
+    detail: &str,
+    hints: &[&str],
+    use_color: bool,
+) -> String {
+    format_error_impl(title, detail, hints, use_color)
+}
+
+fn format_error_impl(title: &str, detail: &str, hints: &[&str], use_color: bool) -> String {
+    let mut output = String::new();
+
+    if use_color {
+        output.push_str(&format!("{} {}\n", "Error:".red().bold(), title.yellow()));
+    } else {
+        output.push_str(&format!("Error: {}\n", title));
+    }
+
+    if !detail.is_empty() {
+        for line in detail.lines() {
+            if use_color {
+                output.push_str(&format!("  {}\n", line.dimmed()));
+            } else {
+                output.push_str(&format!("  {}\n", line));
+            }
+        }
+    }
+
+    for hint in hints {
+        if use_color {
+            output.push_str(&format!("  {} {}\n", "Hint:".green().bold(), hint.white()));
+        } else {
+            output.push_str(&format!("  Hint: {}\n", hint));
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -221,5 +337,75 @@ mod tests {
         let formatter = OutputFormatter::with_color(false);
         let output = formatter.format_diff_lines(&[]);
         assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_separator_formatting_no_color() {
+        let formatter = OutputFormatter::with_color(false);
+        let lines = vec![DiffLine::separator()];
+        let output = formatter.format_diff_lines(&lines);
+        assert!(output.contains("~~~~~~~~"));
+    }
+
+    #[test]
+    fn test_unchanged_lines_with_separator() {
+        let formatter = OutputFormatter::with_color(false);
+        let lines = vec![
+            DiffLine::unchanged(LineNumber::new(10), "fn foo() {".to_string()),
+            DiffLine::added(LineNumber::new(11), "    let x = 1;".to_string()),
+            DiffLine::unchanged(LineNumber::new(12), "}".to_string()),
+            DiffLine::separator(),
+            DiffLine::deleted(LineNumber::new(20), "    old();".to_string()),
+        ];
+        let output = formatter.format_diff_lines(&lines);
+        assert!(output.contains("  L10: fn foo() {"));
+        assert!(output.contains("+ L11:     let x = 1;"));
+        assert!(output.contains("  L12: }"));
+        assert!(output.contains("~~~~~~~~"));
+        assert!(output.contains("- L20:     old();"));
+    }
+
+    #[test]
+    fn test_diff_line_constructors() {
+        let sep = DiffLine::separator();
+        assert_eq!(sep.kind, DiffLineKind::Separator);
+
+        let uc = DiffLine::unchanged(LineNumber::new(5), "ctx".to_string());
+        assert_eq!(uc.kind, DiffLineKind::Unchanged);
+        assert_eq!(uc.line_number, Some(LineNumber::new(5)));
+
+        let ad = DiffLine::added(LineNumber::new(3), "new".to_string());
+        assert_eq!(ad.kind, DiffLineKind::Added);
+
+        let dl = DiffLine::deleted(LineNumber::new(7), "del".to_string());
+        assert_eq!(dl.kind, DiffLineKind::Deleted);
+    }
+
+    #[test]
+    fn test_format_error_no_color() {
+        let output = format_error_with_color(
+            "Location 匹配失败",
+            "  fn main() {\n      let x = 1;\n  ...",
+            &["请检查定位内容，或使用行号定位: //!@Location:@行号"],
+            false,
+        );
+        assert!(output.contains("Error: Location 匹配失败"));
+        assert!(output.contains("fn main()"));
+        assert!(output.contains("Hint: 请检查定位内容"));
+    }
+
+    #[test]
+    fn test_format_error_with_color() {
+        let output = format_error_with_color("Location 匹配失败", "", &["提示内容"], true);
+        assert!(output.contains("Error:"));
+        assert!(output.contains("Hint:"));
+        assert!(output.contains("提示内容"));
+    }
+
+    #[test]
+    fn test_format_error_empty_hints() {
+        let output = format_error_with_color("简单错误", "", &[], false);
+        assert!(output.contains("Error: 简单错误"));
+        assert!(!output.contains("Hint:"));
     }
 }

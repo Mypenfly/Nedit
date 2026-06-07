@@ -249,7 +249,7 @@ fn expect_single_match(
         1 => build_content_block(scope, candidates[0], location.lines.len(), block),
         n => {
             let scoped_lines = scope.lines();
-            let candidate_descriptions: Vec<String> = candidates
+            let mut candidate_descriptions: Vec<String> = candidates
                 .iter()
                 .take(MAX_CANDIDATE_DISPLAY)
                 .map(|&idx| {
@@ -263,6 +263,9 @@ fn expect_single_match(
                     format!("  L{}: {}", line_num, truncated)
                 })
                 .collect();
+            if n > MAX_CANDIDATE_DISPLAY {
+                candidate_descriptions.push(format!("  ({} more)", n - MAX_CANDIDATE_DISPLAY));
+            }
             Err(MatchError::TooManyMatches {
                 count: n,
                 candidates: candidate_descriptions,

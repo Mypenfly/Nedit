@@ -162,7 +162,7 @@ Phase 7: 扩展命令（Include 等）        待实现
 
 ```bash
 cargo build              # 构建
-cargo test               # ~270 个测试
+cargo test               # 297 个测试
 cargo fmt --check        # 格式检查
 cargo clippy -- -D warnings  # Lint
 

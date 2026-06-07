@@ -19,7 +19,7 @@ use crate::error::{FileError, NEditError};
 use crate::matcher::LocationMatcher;
 use crate::model::BLOCK_SNIPPET_MAX_LINES;
 use crate::model::{ContentBlock, FileContent, Line, LineNumber, MatchInfo, SearchScope};
-use crate::output::{DiffLine, DiffLineKind};
+use crate::output::{DiffLine, DiffLineKind, CONTEXT_MAX_LINES};
 use crate::parser::{Command, OffTarget};
 use std::collections::HashMap;
 
@@ -35,6 +35,11 @@ pub struct Engine {
     pub block_stack: Vec<ContentBlock>,
     /// 执行过程中累积的差异输出行（New=Added, Delete=Deleted）
     pub diff_lines: Vec<DiffLine>,
+    /// 上一次记录 diff 时所在的 ContentBlock 标识 (start_line, end_line)
+    /// 用于判断是否需要在输出中插入分隔符
+    last_diff_block_key: Option<(usize, usize)>,
+    /// 详细模式：打印每条命令的执行信息（Phase 6）
+    verbose: bool,
 }
 
 // ============================================================
@@ -133,6 +138,7 @@ fn check_delete_adjacency(block: &ContentBlock, start_idx: usize) -> Result<(), 
 }
 
 /// 记录被删除的行到 diff_lines
+#[allow(dead_code)]
 fn record_deleted_lines(block: &ContentBlock, start_idx: usize, end_idx: usize) -> Vec<DiffLine> {
     block.lines[start_idx..=end_idx]
         .iter()
@@ -185,7 +191,14 @@ impl Engine {
             file: None,
             block_stack: Vec::new(),
             diff_lines: Vec::new(),
+            last_diff_block_key: None,
+            verbose: false,
         }
+    }
+
+    /// 设置详细输出模式
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
     }
 
     /// 执行完整的 AST 命令序列
@@ -194,6 +207,74 @@ impl Engine {
     /// 执行完毕后自动处理隐式 Off:Open（若脚本末尾未显式关闭）。
     pub fn execute(&mut self, commands: Vec<Command>) -> Result<(), NEditError> {
         for command in commands {
+            if self.verbose {
+                match &command {
+                    Command::Open { file_path } => {
+                        eprintln!("[verbose] 执行 Open: {}", file_path);
+                    }
+                    Command::Location {
+                        block,
+                        line_range,
+                        content,
+                    } => {
+                        if let Some(range) = line_range {
+                            eprintln!(
+                                "[verbose] 执行 Location:Block={} @{},{}",
+                                block, range.start, range.end
+                            );
+                        } else {
+                            let first_line = content
+                                .lines
+                                .first()
+                                .map(|l| l.content.as_str())
+                                .unwrap_or("");
+                            eprintln!(
+                                "[verbose] 执行 Location:Block={} \"{}\"",
+                                block,
+                                if first_line.len() > 50 {
+                                    format!("{}...", &first_line[..47])
+                                } else {
+                                    first_line.to_string()
+                                }
+                            );
+                        }
+                    }
+                    Command::New { position, content } => {
+                        eprintln!(
+                            "[verbose] 执行 New:{:?} ({} 行)",
+                            position,
+                            content.lines.len()
+                        );
+                    }
+                    Command::Delete {
+                        block,
+                        line_range,
+                        content,
+                    } => {
+                        if let Some(range) = line_range {
+                            eprintln!("[verbose] 执行 Delete:@{},{}", range.start, range.end);
+                        } else if *block {
+                            eprintln!("[verbose] 执行 Delete:Block");
+                        } else {
+                            let line_count = content.as_ref().map(|c| c.lines.len()).unwrap_or(0);
+                            eprintln!("[verbose] 执行 Delete ({} 行)", line_count);
+                        }
+                    }
+                    Command::Raw { content } => {
+                        eprintln!(
+                            "[verbose] 执行 Raw: \"{}\"",
+                            if content.len() > 30 {
+                                format!("{}...", &content[..27])
+                            } else {
+                                content.clone()
+                            }
+                        );
+                    }
+                    Command::Off { target } => {
+                        eprintln!("[verbose] 执行 Off:{:?}", target);
+                    }
+                }
+            }
             match command {
                 Command::Open { file_path } => {
                     self.execute_open(&file_path)?;
@@ -283,14 +364,15 @@ impl Engine {
             crate::error::EngineError::MissingLocationForNew,
         ))?;
 
-        // 记录所有被删除的行到 diff_lines
-        for line in &block.lines {
-            self.diff_lines.push(DiffLine {
-                kind: DiffLineKind::Deleted,
-                line_number: Some(line.line_num),
-                content: line.content.clone(),
-            });
-        }
+        // 收集 delete 的上下文和行数据（在被修改之前）
+        let total = block.lines.len();
+        let diff_data = if total > 0 {
+            let (changed, context_above, context_below) =
+                Self::collect_deleted_diff_data(block, 0, total.saturating_sub(1));
+            Some((changed, context_above, context_below))
+        } else {
+            None
+        };
 
         // 保留首行的行号，清空所有行
         let first_line_num = block.start_line;
@@ -305,6 +387,10 @@ impl Engine {
         // 更新 match_info，确保后续 New:Normal 能正确插入
         block.match_info = MatchInfo::DeleteAt { position: 0 };
         block.reindex();
+
+        if let Some((changed, context_above, context_below)) = diff_data {
+            self.record_diff_with_context(changed, context_above, context_below);
+        }
         Ok(())
     }
 
@@ -333,9 +419,9 @@ impl Engine {
             }));
         }
 
-        // 记录删除行到 diff_lines
-        let deleted = record_deleted_lines(block, start_index, end_index);
-        self.diff_lines.extend(deleted);
+        // 在删除之前收集上下文和删除行数据
+        let (changed, context_above, context_below) =
+            Self::collect_deleted_diff_data(block, start_index, end_index);
 
         // 执行删除
         block.lines.drain(start_index..=end_index);
@@ -343,7 +429,70 @@ impl Engine {
             position: start_index,
         };
         block.reindex();
+
+        self.record_diff_with_context(changed, context_above, context_below);
         Ok(())
+    }
+
+    /// 执行 Delete 命令：在 ContentBlock 中删除匹配内容
+    ///
+    /// 若 `block` 为 true（Delete:Block），删除整个 ContentBlock.
+    /// 若 `line_range` 有值（Phase 5），按行号直接删除。
+    /// 否则在 block 内逐行匹配并删除。
+    fn execute_delete(
+        &mut self,
+        block: bool,
+        content: Option<&crate::model::DeleteContent>,
+        line_range: Option<&crate::model::LineRange>,
+    ) -> Result<(), NEditError> {
+        if block {
+            return self.execute_delete_block();
+        }
+
+        if let Some(range) = line_range {
+            return self.execute_delete_by_line_range(*range);
+        }
+
+        let del_content = content.ok_or(NEditError::Engine(
+            crate::error::EngineError::MissingLocationForNew,
+        ))?;
+
+        let current_block = self.block_stack.last_mut().ok_or(NEditError::Engine(
+            crate::error::EngineError::MissingLocationForNew,
+        ))?;
+
+        let (start_idx, end_idx) = match find_delete_match(current_block, del_content) {
+            Some(range) => range,
+            None => return Err(delete_not_found_error(del_content, current_block)),
+        };
+
+        // 检查 Delete 匹配是否紧邻 Location 的最后一行
+        check_delete_adjacency(current_block, start_idx)?;
+
+        // 在删除之前收集上下文和删除行数据
+        let (changed, context_above, context_below) =
+            Self::collect_deleted_diff_data(current_block, start_idx, end_idx);
+
+        // 执行删除并更新定位信息
+        current_block.lines.drain(start_idx..=end_idx);
+        current_block.match_info = MatchInfo::DeleteAt {
+            position: start_idx,
+        };
+        current_block.reindex();
+
+        self.record_diff_with_context(changed, context_above, context_below);
+        Ok(())
+    }
+
+    /// 记录新增行到 diff_lines（无上下文，用于文件级 New:Start/New:End）
+    fn record_added_lines(&mut self, entries: Vec<(usize, String)>) {
+        for (line_num, content) in entries {
+            self.diff_lines.push(DiffLine {
+                kind: DiffLineKind::Added,
+                line_number: Some(LineNumber::new(line_num)),
+                content,
+            });
+        }
     }
 
     /// 获取当前 Location 的搜索范围
@@ -410,12 +559,10 @@ impl Engine {
         position: &crate::parser::NewPosition,
         content: &crate::model::NewContent,
     ) -> Result<(), NEditError> {
-        use crate::parser::NewPosition;
-
         match position {
-            NewPosition::Start => self.execute_new_start(content),
-            NewPosition::End => self.execute_new_end(content),
-            NewPosition::Normal => self.execute_new_normal(content),
+            crate::parser::NewPosition::Start => self.execute_new_start(content),
+            crate::parser::NewPosition::End => self.execute_new_end(content),
+            crate::parser::NewPosition::Normal => self.execute_new_normal(content),
         }
     }
 
@@ -423,24 +570,23 @@ impl Engine {
     fn execute_new_start(&mut self, content: &crate::model::NewContent) -> Result<(), NEditError> {
         let new_lines = build_new_lines(content);
         let new_line_count = new_lines.len();
-        let added_entries = {
-            if let Some(ref mut block) = self.block_stack.last_mut() {
-                let mut combined = new_lines;
-                combined.append(&mut block.lines);
-                block.lines = combined;
-                block.reindex();
-                collect_new_line_info(block, 0, new_line_count)
-            } else if let Some(ref mut file) = self.file {
-                let mut combined = new_lines;
-                combined.append(&mut file.lines);
-                file.lines = combined;
-                reindex_file(file);
-                collect_new_file_line_info(file, 0, new_line_count)
-            } else {
-                Vec::new()
-            }
-        };
-        self.record_added_lines(added_entries);
+
+        if let Some(block) = self.block_stack.last_mut() {
+            let mut combined = new_lines;
+            combined.append(&mut block.lines);
+            block.lines = combined;
+            block.reindex();
+            let (changed, context_above, context_below) =
+                Self::collect_added_diff_data(block, 0, new_line_count);
+            self.record_diff_with_context(changed, context_above, context_below);
+        } else if let Some(ref mut file) = self.file {
+            let mut combined = new_lines;
+            combined.append(&mut file.lines);
+            file.lines = combined;
+            reindex_file(file);
+            let added_entries = collect_new_file_line_info(file, 0, new_line_count);
+            self.record_added_lines(added_entries);
+        }
         Ok(())
     }
 
@@ -448,27 +594,22 @@ impl Engine {
     fn execute_new_end(&mut self, content: &crate::model::NewContent) -> Result<(), NEditError> {
         let new_lines = build_new_lines(content);
         let new_line_count = new_lines.len();
-        let added_entries = {
-            let insert_start = if let Some(block) = self.block_stack.last() {
-                block.lines.len()
-            } else if let Some(ref file) = self.file {
-                file.lines.len()
-            } else {
-                0
-            };
-            if let Some(ref mut block) = self.block_stack.last_mut() {
-                block.lines.extend(new_lines);
-                block.reindex();
-                collect_new_line_info(block, insert_start, new_line_count)
-            } else if let Some(ref mut file) = self.file {
-                file.lines.extend(new_lines);
-                reindex_file(file);
-                collect_new_file_line_info(file, insert_start, new_line_count)
-            } else {
-                Vec::new()
-            }
-        };
-        self.record_added_lines(added_entries);
+
+        if let Some(block) = self.block_stack.last_mut() {
+            let insert_start = block.lines.len();
+            block.lines.extend(new_lines);
+            block.reindex();
+            let (changed, context_above, context_below) =
+                Self::collect_added_diff_data(block, insert_start, new_line_count);
+            self.record_diff_with_context(changed, context_above, context_below);
+        } else if let Some(ref mut file) = self.file {
+            let insert_start = file.lines.len();
+            let new_lines_clone = build_new_lines(content);
+            file.lines.extend(new_lines_clone);
+            reindex_file(file);
+            let added_entries = collect_new_file_line_info(file, insert_start, new_line_count);
+            self.record_added_lines(added_entries);
+        }
         Ok(())
     }
 
@@ -488,7 +629,7 @@ impl Engine {
         let new_lines = build_new_lines(content);
         let new_line_count = new_lines.len();
 
-        let added_entries = {
+        let (changed, context_above, context_below) = {
             let block = self.block_stack.last_mut().ok_or(NEditError::Engine(
                 crate::error::EngineError::MissingLocationForNew,
             ))?;
@@ -500,69 +641,101 @@ impl Engine {
                 block.lines.extend(tail);
             }
             block.reindex();
-            collect_new_line_info(block, insert_pos, new_line_count)
+            Self::collect_added_diff_data(block, insert_pos, new_line_count)
         };
-        self.record_added_lines(added_entries);
+
+        self.record_diff_with_context(changed, context_above, context_below);
         Ok(())
     }
 
-    /// 记录新增行到 diff_lines
-    fn record_added_lines(&mut self, entries: Vec<(usize, String)>) {
-        for (line_num, content) in entries {
-            self.diff_lines.push(DiffLine {
-                kind: DiffLineKind::Added,
-                line_number: Some(LineNumber::new(line_num)),
-                content,
-            });
-        }
-    }
-
-    /// 执行 Delete 命令：在 ContentBlock 中删除匹配内容
+    /// 记录差异行，包含上下文和分隔符（Phase 6）
     ///
-    /// 若 `block` 为 true（Delete:Block），删除整个 ContentBlock.
-    /// 若 `line_range` 有值（Phase 5），按行号直接删除。
-    /// 否则在 block 内逐行匹配并删除。
-    fn execute_delete(
+    /// 在记录 Added/Deleted 行之前，先插入上下文行（上下各最多 CONTEXT_MAX_LINES 行）
+    /// 和分隔符（若 ContentBlock 发生变化）。
+    fn record_diff_with_context(
         &mut self,
-        block: bool,
-        content: Option<&crate::model::DeleteContent>,
-        line_range: Option<&crate::model::LineRange>,
-    ) -> Result<(), NEditError> {
-        if block {
-            return self.execute_delete_block();
+        changed_lines: Vec<DiffLine>,
+        context_above: Vec<DiffLine>,
+        context_below: Vec<DiffLine>,
+    ) {
+        self.insert_separator_if_needed();
+
+        for line in context_above {
+            self.diff_lines.push(line);
+        }
+        for line in changed_lines {
+            self.diff_lines.push(line);
+        }
+        for line in context_below {
+            self.diff_lines.push(line);
         }
 
-        if let Some(range) = line_range {
-            return self.execute_delete_by_line_range(*range);
+        self.update_diff_block_key();
+    }
+
+    /// 获取 ContentBlock 的唯一标识
+    fn get_block_key(block: &ContentBlock) -> (usize, usize) {
+        (block.start_line.to_usize(), block.end_line.to_usize())
+    }
+
+    /// 获取当前 ContentBlock 的唯一标识
+    fn get_current_block_key(&self) -> Option<(usize, usize)> {
+        self.block_stack.last().map(Self::get_block_key)
+    }
+
+    /// 若当前 ContentBlock 与上一次不同，插入分隔符
+    fn insert_separator_if_needed(&mut self) {
+        let current_key = self.get_current_block_key();
+        if current_key != self.last_diff_block_key
+            && self.last_diff_block_key.is_some()
+            && !self.diff_lines.is_empty()
+        {
+            self.diff_lines.push(DiffLine::separator());
         }
+    }
 
-        let del_content = content.ok_or(NEditError::Engine(
-            crate::error::EngineError::MissingLocationForNew,
-        ))?;
+    /// 更新最后一次记录的 block key
+    fn update_diff_block_key(&mut self) {
+        self.last_diff_block_key = self.get_current_block_key();
+    }
 
-        let current_block = self.block_stack.last_mut().ok_or(NEditError::Engine(
-            crate::error::EngineError::MissingLocationForNew,
-        ))?;
+    /// 收集新增行的 diff 数据（changed + context），供调用方传给 record_diff_with_context
+    fn collect_added_diff_data(
+        block: &ContentBlock,
+        insert_pos: usize,
+        new_line_count: usize,
+    ) -> (Vec<DiffLine>, Vec<DiffLine>, Vec<DiffLine>) {
+        let end_idx = (insert_pos + new_line_count).min(block.lines.len());
+        let context_above = collect_block_context_above(block, insert_pos);
+        let context_below = collect_block_context_below(block, end_idx.saturating_sub(1));
+        let changed: Vec<DiffLine> = block.lines[insert_pos..end_idx]
+            .iter()
+            .map(|line| DiffLine {
+                kind: DiffLineKind::Added,
+                line_number: Some(line.line_num),
+                content: line.content.clone(),
+            })
+            .collect();
+        (changed, context_above, context_below)
+    }
 
-        let (start_idx, end_idx) = match find_delete_match(current_block, del_content) {
-            Some(range) => range,
-            None => return Err(delete_not_found_error(del_content, current_block)),
-        };
-
-        // 检查 Delete 匹配是否紧邻 Location 的最后一行
-        check_delete_adjacency(current_block, start_idx)?;
-
-        // 记录删除行到 diff_lines
-        let deleted = record_deleted_lines(current_block, start_idx, end_idx);
-        self.diff_lines.extend(deleted);
-
-        // 执行删除并更新定位信息
-        current_block.lines.drain(start_idx..=end_idx);
-        current_block.match_info = MatchInfo::DeleteAt {
-            position: start_idx,
-        };
-        current_block.reindex();
-        Ok(())
+    /// 收集删除行的 diff 数据（changed + context），供调用方传给 record_diff_with_context
+    fn collect_deleted_diff_data(
+        block: &ContentBlock,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> (Vec<DiffLine>, Vec<DiffLine>, Vec<DiffLine>) {
+        let context_above = collect_block_context_above(block, start_idx);
+        let context_below = collect_block_context_below(block, end_idx);
+        let changed: Vec<DiffLine> = block.lines[start_idx..=end_idx]
+            .iter()
+            .map(|line| DiffLine {
+                kind: DiffLineKind::Deleted,
+                line_number: Some(line.line_num),
+                content: line.content.clone(),
+            })
+            .collect();
+        (changed, context_above, context_below)
     }
 }
 
@@ -676,6 +849,7 @@ fn build_new_lines(content: &crate::model::NewContent) -> Vec<Line> {
 }
 
 /// 从 ContentBlock 中收集新增行的 (line_num, content) 信息
+#[allow(dead_code)]
 fn collect_new_line_info(
     block: &ContentBlock,
     insert_pos: usize,
@@ -705,6 +879,38 @@ fn collect_new_file_line_info(
                 file.lines[i].line_num.to_usize(),
                 file.lines[i].content.clone(),
             )
+        })
+        .collect()
+}
+
+/// 从 ContentBlock 中收集指定位置之前的上下文行（最多 CONTEXT_MAX_LINES 行）
+fn collect_block_context_above(block: &ContentBlock, position: usize) -> Vec<DiffLine> {
+    if position == 0 {
+        return Vec::new();
+    }
+    let start = position.saturating_sub(CONTEXT_MAX_LINES);
+    block.lines[start..position]
+        .iter()
+        .map(|line| DiffLine {
+            kind: DiffLineKind::Unchanged,
+            line_number: Some(line.line_num),
+            content: line.content.clone(),
+        })
+        .collect()
+}
+
+/// 从 ContentBlock 中收集指定位置之后的上下文行（最多 CONTEXT_MAX_LINES 行）
+fn collect_block_context_below(block: &ContentBlock, position: usize) -> Vec<DiffLine> {
+    if position + 1 >= block.lines.len() {
+        return Vec::new();
+    }
+    let end = (position + 1 + CONTEXT_MAX_LINES).min(block.lines.len());
+    block.lines[position + 1..end]
+        .iter()
+        .map(|line| DiffLine {
+            kind: DiffLineKind::Unchanged,
+            line_number: Some(line.line_num),
+            content: line.content.clone(),
         })
         .collect()
 }
@@ -1149,10 +1355,16 @@ mod tests {
             .execute_new(&NewPosition::Normal, &make_new_content(&["    let x = 1;"]))
             .unwrap();
 
-        assert_eq!(engine.diff_lines.len(), 1);
-        assert_eq!(engine.diff_lines[0].kind, DiffLineKind::Added);
-        assert_eq!(engine.diff_lines[0].content, "    let x = 1;");
-        assert!(engine.diff_lines[0].line_number.is_some());
+        // 过滤出 Added 行（忽略上下文 Unchanged 行和分隔符）
+        let added: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Added)
+            .collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].kind, DiffLineKind::Added);
+        assert_eq!(added[0].content, "    let x = 1;");
+        assert!(added[0].line_number.is_some());
     }
 
     #[test]
@@ -1167,10 +1379,15 @@ mod tests {
             .execute_delete(false, Some(&make_delete_content(&["    let x = 1;"])), None)
             .unwrap();
 
-        assert_eq!(engine.diff_lines.len(), 1);
-        assert_eq!(engine.diff_lines[0].kind, DiffLineKind::Deleted);
-        assert_eq!(engine.diff_lines[0].content, "    let x = 1;");
-        assert!(engine.diff_lines[0].line_number.is_some());
+        let deleted: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Deleted)
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].kind, DiffLineKind::Deleted);
+        assert_eq!(deleted[0].content, "    let x = 1;");
+        assert!(deleted[0].line_number.is_some());
     }
 
     #[test]
@@ -1203,11 +1420,20 @@ mod tests {
         let result = engine.execute(commands);
         assert!(result.is_ok(), "Unexpected error: {:?}", result.err());
 
-        assert_eq!(engine.diff_lines.len(), 2);
-        assert_eq!(engine.diff_lines[0].kind, DiffLineKind::Deleted);
-        assert_eq!(engine.diff_lines[0].content, "    old_code();");
-        assert_eq!(engine.diff_lines[1].kind, DiffLineKind::Added);
-        assert_eq!(engine.diff_lines[1].content, "    let x = 1;");
+        let added: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Added)
+            .collect();
+        let deleted: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Deleted)
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].content, "    old_code();");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].content, "    let x = 1;");
     }
 
     #[test]
@@ -2301,9 +2527,14 @@ mod tests {
             .execute_delete(false, None, Some(&line_range))
             .unwrap();
 
-        assert_eq!(engine.diff_lines.len(), 1);
-        assert_eq!(engine.diff_lines[0].kind, DiffLineKind::Deleted);
-        assert_eq!(engine.diff_lines[0].content, "line2");
+        let deleted: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Deleted)
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].kind, DiffLineKind::Deleted);
+        assert_eq!(deleted[0].content, "line2");
     }
 
     #[test]
@@ -2504,8 +2735,13 @@ mod tests {
         assert_eq!(block.lines.len(), 2);
         assert_eq!(block.lines[0].content, "second");
         assert_eq!(block.lines[1].content, "third");
-        assert_eq!(engine.diff_lines.len(), 1);
-        assert_eq!(engine.diff_lines[0].content, "first");
+        let deleted: Vec<_> = engine
+            .diff_lines
+            .iter()
+            .filter(|d| d.kind == DiffLineKind::Deleted)
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].content, "first");
     }
 
     /// 测试：行号 Delete 最后一行

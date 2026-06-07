@@ -40,6 +40,7 @@ pub enum Expression {
     /// A variable assignment: `x = 5`
     Assignment {
         target: Box<Expression>,
+		nothing:String,
         value: Box<Expression>,
     },
     /// A binary operation: `a + b`, `x && y`
@@ -91,7 +92,6 @@ pub enum BinaryOperator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixOperator {
     Negate,        // -
-    Not,           // !
 }
 
 impl BinaryOperator {
